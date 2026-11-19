@@ -8,12 +8,16 @@ All logikk samlet ett sted, så den kan brukes av:
 Hovedfunksjonene er:
     df = les_garmin("data/Activities_løping.csv")
     stats = analyser(df)   # -> dict som kan lagres som JSON
+
+    # Med brukerens egne opplysninger (alt valgfritt):
+    stats = analyser(df, Profil(niva="intermediate", makspuls=195))
 """
 
 from __future__ import annotations
 
 import math
 import re
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import IO
 
@@ -169,16 +173,117 @@ def okttype_fra_tittel(tittel) -> str | None:
     return None
 
 
+# --- Løperprofil: nivå, makspuls og ukesnitt ---------------------------------
+# Det som er "langt" eller "hardt" avhenger av hvem som løper. Profilen fylles ut
+# av brukeren (valgfritt) og resten regnes ut fra dataene.
+
+# Grove tommelfingerregler – juster gjerne. Brukes til å foreslå nivå fra ukesnittet,
+# og som standardverdier når en ny bruker har for lite data.
+NIVAER = {
+    #               fra km/uke   typisk tur (km)   typisk ukesnitt (km)
+    "beginner":     {"fra_km_uke": 0,  "typisk_tur_km": 4,  "ukesnitt_km": 10},
+    "amateur":      {"fra_km_uke": 15, "typisk_tur_km": 7,  "ukesnitt_km": 22},
+    "intermediate": {"fra_km_uke": 30, "typisk_tur_km": 10, "ukesnitt_km": 40},
+    "experienced":  {"fra_km_uke": 50, "typisk_tur_km": 13, "ukesnitt_km": 60},
+}
+MIN_TURER_FOR_DATA = 8  # færre gyldige turer enn dette -> bruk nivåets standardverdier
+
+
+@dataclass
+class Profil:
+    """Det brukeren kan oppgi selv. Alt er valgfritt – det som mangler regnes ut fra dataene."""
+    niva: str | None = None          # "beginner" | "amateur" | "intermediate" | "experienced"
+    makspuls: float | None = None    # bedre enn å gjette fra dataene, hvis brukeren vet den
+    ukesnitt_km: float | None = None
+
+
+@dataclass
+class BeregnetProfil:
+    """Ferdig utfylt profil som resten av analysen bruker. `kilder` viser hvor hver verdi kom fra."""
+    niva: str
+    makspuls: float
+    ukesnitt_km: float
+    typisk_tur_km: float
+    typisk_tempo_s: float
+    foreslatt_niva: str              # det dataene tyder på, uansett hva brukeren valgte
+    kilder: dict = field(default_factory=dict)
+
+
+def _gyldige(df: pd.DataFrame) -> pd.DataFrame:
+    return df[(df["km"] >= 2) & (df["tempo_s"] <= 9 * 60)]
+
+
+def niva_fra_ukesnitt(km_uke: float) -> str:
+    niva = "beginner"
+    for navn, n in NIVAER.items():
+        if km_uke >= n["fra_km_uke"]:
+            niva = navn
+    return niva
+
+
+def beregn_ukesnitt(df: pd.DataFrame, siste_uker: int = 12) -> float | None:
+    """Snitt km per uke over de siste `siste_uker` *aktive* ukene (pauser teller ikke)."""
+    g = _gyldige(df)
+    if g.empty:
+        return None
+    uker = g.set_index("dato")["km"].resample("W-MON").sum()
+    aktive = uker[uker > 0]
+    return float(aktive.tail(siste_uker).mean()) if not aktive.empty else None
+
+
+def lag_profil(df: pd.DataFrame, profil: Profil | None = None) -> BeregnetProfil:
+    """Fyller ut profilen: brukerens verdier først, så dataene, så nivåets standardverdier."""
+    profil = profil or Profil()
+    if profil.niva is not None and profil.niva not in NIVAER:
+        raise ValueError(f"Ukjent nivå '{profil.niva}'. Velg en av {list(NIVAER)}")
+    g = _gyldige(df)
+    nok_data = len(g) >= MIN_TURER_FOR_DATA
+    kilder = {}
+
+    # Ukesnitt og nivå
+    ukesnitt_data = beregn_ukesnitt(df)
+    foreslatt = niva_fra_ukesnitt(ukesnitt_data) if ukesnitt_data else "beginner"
+    niva = profil.niva or foreslatt
+    kilder["niva"] = "bruker" if profil.niva else "data"
+
+    if profil.ukesnitt_km:
+        ukesnitt, kilder["ukesnitt_km"] = profil.ukesnitt_km, "bruker"
+    elif nok_data and ukesnitt_data:
+        ukesnitt, kilder["ukesnitt_km"] = ukesnitt_data, "data"
+    else:
+        ukesnitt, kilder["ukesnitt_km"] = NIVAER[niva]["ukesnitt_km"], "nivå"
+
+    # Typisk turlengde og tempo
+    if nok_data:
+        typisk_km, kilder["typisk_tur_km"] = float(g["km"].median()), "data"
+    else:
+        typisk_km, kilder["typisk_tur_km"] = NIVAER[niva]["typisk_tur_km"], "nivå"
+    basis = g if not g.empty else df
+    typisk_tempo = float(basis["gap_s"].median())
+
+    # Makspuls: brukerens verdi er best. Den høyeste i dataene er ofte for lav
+    # (man er sjelden helt på maks), men det er det beste vi har.
+    if profil.makspuls:
+        makspuls, kilder["makspuls"] = float(profil.makspuls), "bruker"
+    else:
+        makspuls, kilder["makspuls"] = float(df["makspuls"].max()), "data"
+
+    return BeregnetProfil(niva=niva, makspuls=makspuls, ukesnitt_km=round(ukesnitt, 1),
+                          typisk_tur_km=round(typisk_km, 1), typisk_tempo_s=typisk_tempo,
+                          foreslatt_niva=foreslatt, kilder=kilder)
+
+
 # --- Features til maskinlæringsmodellen -------------------------------------
-# Alt er *relativt* til personens egne data, så en modell trent på én person
-# kan brukes på andre (som har annen makspuls, annet tempo og annen turlengde).
+# Alt er *relativt* til løperens egen profil, så en modell trent på én person
+# kan brukes på andre (som har annen makspuls, annet tempo og annet volum).
 
 FEATURES = [
-    "km_rel",         # turlengde / personens typiske turlengde
-    "puls_rel",       # snittpuls / personens høyeste registrerte puls
-    "makspuls_rel",   # makspuls / personens høyeste registrerte puls
-    "puls_spenn",     # (makspuls - snittpuls) / høyeste puls – stor for intervaller
-    "tempo_rel",      # bakkejustert tempo / personens typiske tempo (<1 = raskere enn vanlig)
+    "km_rel",         # turlengde / løperens typiske turlengde
+    "andel_av_uke",   # turlengde / løperens ukesnitt – stor andel = langtur (avhenger av antall turer i uka)
+    "puls_rel",       # snittpuls / makspuls
+    "makspuls_rel",   # turens makspuls / løperens makspuls
+    "puls_spenn",     # (makspuls - snittpuls) / makspuls – stor for intervaller
+    "tempo_rel",      # bakkejustert tempo / løperens typiske tempo (<1 = raskere enn vanlig)
     "runder_per_km",  # mange korte runder = intervaller
 ]
 # Uten runder: for løpere som bare har automatiske runder per km. Da sier rundene
@@ -187,7 +292,7 @@ FEATURES_UTEN_RUNDER = [f for f in FEATURES if f != "runder_per_km"]
 
 
 def runder_er_informative(X: pd.DataFrame) -> bool:
-    """Har personen runder som følger øktstrukturen (Runna, Garmin-økter, rundeknapp)?
+    """Har løperen runder som følger øktstrukturen (Runna, Garmin-økter, rundeknapp)?
 
     Med bare auto-runder per km ligger runder_per_km rett rundt 1 på alle turer.
     Har minst 10 % av turene 1,3 runder per km eller mer, regner vi rundene som nyttige.
@@ -196,21 +301,16 @@ def runder_er_informative(X: pd.DataFrame) -> bool:
     return len(r) > 0 and (r >= 1.3).mean() >= 0.10
 
 
-def lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Lager modell-features. Bruker bare gyldige turer til å regne ut 'typisk'."""
-    basis = df[(df["km"] >= 2) & (df["tempo_s"] <= 9 * 60)]
-    if basis.empty:
-        basis = df
-    hoyeste_puls = df["makspuls"].max()
-    typisk_km = basis["km"].median()
-    typisk_tempo = basis["gap_s"].median()
-
+def lag_features(df: pd.DataFrame, profil: BeregnetProfil | None = None) -> pd.DataFrame:
+    """Lager modell-features relativt til løperprofilen."""
+    p = profil or lag_profil(df)
     X = pd.DataFrame(index=df.index)
-    X["km_rel"] = df["km"] / typisk_km
-    X["puls_rel"] = df["snittpuls"] / hoyeste_puls
-    X["makspuls_rel"] = df["makspuls"] / hoyeste_puls
-    X["puls_spenn"] = (df["makspuls"] - df["snittpuls"]) / hoyeste_puls
-    X["tempo_rel"] = df["gap_s"] / typisk_tempo
+    X["km_rel"] = df["km"] / p.typisk_tur_km
+    X["andel_av_uke"] = df["km"] / p.ukesnitt_km
+    X["puls_rel"] = df["snittpuls"] / p.makspuls
+    X["makspuls_rel"] = df["makspuls"] / p.makspuls
+    X["puls_spenn"] = (df["makspuls"] - df["snittpuls"]) / p.makspuls
+    X["tempo_rel"] = df["gap_s"] / p.typisk_tempo_s
     X["runder_per_km"] = df["runder"] / df["km"]
     return X[FEATURES]
 
@@ -231,13 +331,16 @@ def last_modell() -> dict | None:
     return _modell_cache
 
 
-def _gjett_med_regler(df: pd.DataFrame) -> pd.Series:
-    """Reserveløsning hvis modellen ikke finnes. Pulsgrensen er relativ til personens makspuls."""
-    hoyeste_puls = df["makspuls"].max()
-    rolig_grense = 0.80 * hoyeste_puls if pd.notna(hoyeste_puls) else 150
+def _gjett_med_regler(df: pd.DataFrame, p: BeregnetProfil) -> pd.Series:
+    """Reserveløsning hvis modellen ikke finnes. Alle grenser er relative til løperprofilen."""
+    rolig_grense = 0.80 * p.makspuls
 
     def gjett(rad) -> str:
-        if rad["km"] >= 10:
+        # Lang: godt over løperens vanlige tur OG en stor del av ukevolumet.
+        # Vi bruker den største grensen: med 3 turer i uka er *hver* tur ~30 % av uka,
+        # og med 6 turer i uka kan en vanlig tur være kort sammenlignet med langturen.
+        lang_grense = max(1.4 * p.typisk_tur_km, 0.35 * p.ukesnitt_km)
+        if rad["km"] >= lang_grense:
             return "lang"
         if pd.notna(rad["runder"]) and rad["runder"] / rad["km"] >= 1.8:
             return "hard"
@@ -248,14 +351,16 @@ def _gjett_med_regler(df: pd.DataFrame) -> pd.Series:
     return df.apply(gjett, axis=1)
 
 
-def klassifiser(df: pd.DataFrame, bruk_modell: bool = True) -> pd.DataFrame:
+def klassifiser(df: pd.DataFrame, profil: Profil | BeregnetProfil | None = None,
+                bruk_modell: bool = True) -> pd.DataFrame:
     """Setter `okttype` (rolig/lang/tempo/hard) og `kilde`.
 
     1. Står typen i tittelen ("Easy Run", "4x4 intervall", "langtur" …) brukes den  -> kilde="tittel"
     2. Ellers predikerer ML-modellen typen                                          -> kilde="modell"
-       (modellen med runder hvis personens runder følger øktene, ellers den uten)
+       (modellen med runder hvis løperens runder følger øktene, ellers den uten)
     3. Finnes ingen modell (eller pulsdata mangler), brukes enkle regler            -> kilde="regel"
     """
+    p = profil if isinstance(profil, BeregnetProfil) else lag_profil(df, profil)
     df = df.copy()
     fra_tittel = df["tittel"].map(okttype_fra_tittel)
     df["okttype"] = fra_tittel
@@ -264,13 +369,13 @@ def klassifiser(df: pd.DataFrame, bruk_modell: bool = True) -> pd.DataFrame:
 
     mangler = fra_tittel.isna()
     if mangler.any():
-        regler = _gjett_med_regler(df)
+        regler = _gjett_med_regler(df, p)
         df.loc[mangler, "okttype"] = regler[mangler]
         df.loc[mangler, "kilde"] = "regel"
 
         modeller = last_modell() if bruk_modell else None
         if modeller is not None:
-            X = lag_features(df)
+            X = lag_features(df, p)
             if runder_er_informative(X):
                 modell, features = modeller["med_runder"], FEATURES
             else:
@@ -306,12 +411,14 @@ def _poster(df: pd.DataFrame) -> list[dict]:
     return [{k: _rens(v) for k, v in rad.items()} for rad in df.to_dict(orient="records")]
 
 
-def analyser(df: pd.DataFrame, pause_uker: int = 4) -> dict:
+def analyser(df: pd.DataFrame, profil: Profil | None = None, pause_uker: int = 4) -> dict:
     """Kjører hele analysen og returnerer alt nettsiden trenger.
 
+    `profil` er det brukeren har oppgitt (nivå, makspuls, ukesnitt) – alt valgfritt.
     Inneholder bevisst ikke titler eller klokkeslett (personvern) – bare datoer og tall.
     """
-    df = klassifiser(legg_til_perioder(df, pause_uker))
+    p = lag_profil(df, profil)
+    df = klassifiser(legg_til_perioder(df, pause_uker), p)
     g = df[df["gyldig"]]
 
     # Nøkkeltall
@@ -359,7 +466,11 @@ def analyser(df: pd.DataFrame, pause_uker: int = 4) -> dict:
     turer = g[["dato", "km", "tempo_s", "gap_s", "snittpuls", "makspuls",
                "okttype", "kilde", "periode", "meter_per_slag"]]
 
+    loperprofil = asdict(p)
+    loperprofil["typisk_tempo"] = sek_til_tempo(loperprofil.pop("typisk_tempo_s"))
+
     return {
+        "loperprofil": loperprofil,
         "nokkeltall": nokkeltall,
         "form": {
             "naa": _rens(na_form),
